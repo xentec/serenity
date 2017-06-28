@@ -10,6 +10,8 @@ use std::sync::RwLock;
 
 #[allow(type_complexity)]
 pub trait EventHandler {
+    #[cfg(feature="cache")]
+    fn on_cached(&self, Context, Vec<GuildId>) {}
     fn on_channel_create(&self, Context, Channel) {}
     fn on_channel_delete(&self, Context, Channel) {}
     fn on_channel_pins_update(&self, Context, ChannelPinsUpdateEvent) {}

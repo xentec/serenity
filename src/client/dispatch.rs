@@ -1,14 +1,16 @@
 use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time;
 use super::event_handler::EventHandler;
 use super::Context;
 use typemap::ShareMap;
 use ::gateway::Shard;
 use ::model::event::Event;
-use ::model::Message;
+use ::model::{Message, Reaction, GuildId};
+use chrono::{Utc, Timelike};
 
 #[cfg(feature="framework")]
-use ::ext::framework::Framework;
+use ::ext::framework::{Framework, ReactionAction};
 
 #[cfg(feature="cache")]
 use super::CACHE;
@@ -48,6 +50,10 @@ macro_rules! update {
     };
 }
 
+macro_rules! now {
+    () => (Utc::now().time().second() * 1000)
+}
+
 fn context(conn: &Arc<Mutex<Shard>>,
            data: &Arc<Mutex<ShareMap>>) -> Context {
     Context::new(conn.clone(), data.clone())
@@ -74,6 +80,58 @@ pub fn dispatch<H: EventHandler + Send + Sync + 'static>(event: Event,
                 dispatch_message(context, event.message, event_handler);
             }
         },
+        Event::ReactionAdd(event) => {
+            let context = context(conn, data);
+            let framework = framework.lock().unwrap();
+
+            if framework.initialized {
+                dispatch_reaction_add(context.clone(),
+                                      event.reaction.clone(),
+                                      event_handler);
+                
+                let res = framework.reaction_actions
+                    .iter()
+                    .find(|&(ra, _)| {
+                        if let ReactionAction::Add(ref kind) = *ra {
+                            *kind == event.reaction.emoji 
+                        } else {
+                            false
+                        }
+                    });
+                
+                if let Some((_, f)) = res {
+                    f(context, event.reaction.message_id, event.reaction.channel_id);
+                }
+            } else {
+                dispatch_reaction_add(context, event.reaction, event_handler);
+            }
+        },
+        Event::ReactionRemove(event) => {
+            let context = context(conn, data);
+            let framework = framework.lock().unwrap();
+
+            if framework.initialized {
+                dispatch_reaction_remove(context.clone(),
+                                         event.reaction.clone(),
+                                         event_handler);
+                
+                let res = framework.reaction_actions
+                    .iter()
+                    .find(|&(ra, _)| {
+                        if let ReactionAction::Remove(ref kind) = *ra {
+                            *kind == event.reaction.emoji 
+                        } else {
+                            false
+                        }
+                    });
+                
+                if let Some((_, f)) = res {
+                    f(context, event.reaction.message_id, event.reaction.channel_id);
+                }
+            } else {
+                dispatch_reaction_remove(context, event.reaction, event_handler);
+            }
+        },
         other => handle_event(other, conn, data, event_handler),
     }
 }
@@ -89,6 +147,14 @@ pub fn dispatch<H: EventHandler + Send + Sync + 'static>(event: Event,
             dispatch_message(context,
                              event.message,
                              event_handler);
+        },
+        Event::ReactionAdd(event) => {
+            let context = context(conn, data);
+            dispatch_reaction_add(context, event.reaction);
+        },
+        Event::ReactionRemove(event) => {
+            let context = context(conn, data);
+            dispatch_reaction_remove(context, event.reaction);
         },
         other => handle_event(other, conn, data, event_handler),
     }
@@ -109,11 +175,43 @@ fn dispatch_message<H: EventHandler + Send + Sync + 'static>(context: Context,
     });
 }
 
+fn dispatch_reaction_add<H: EventHandler + Send + Sync + 'static>(context: Context,
+                         reaction: Reaction,
+                         event_handler: &Arc<H>) {
+    let h = event_handler.clone();
+    thread::spawn(move || {
+        h.on_reaction_add(context, reaction);
+    });
+}
+
+fn dispatch_reaction_remove<H: EventHandler + Send + Sync + 'static>(context: Context,
+                         reaction: Reaction,
+                         event_handler: &Arc<H>) {
+    let h = event_handler.clone();
+    thread::spawn(move || {
+        h.on_reaction_remove(context, reaction);
+    });
+}
+
 #[allow(cyclomatic_complexity, unused_assignments, unused_mut)]
 fn handle_event<H: EventHandler + Send + Sync + 'static>(event: Event,
                 conn: &Arc<Mutex<Shard>>,
                 data: &Arc<Mutex<ShareMap>>,
                 event_handler: &Arc<H>) {
+    #[cfg(feature="cache")]
+    let mut last_guild_create_time = now!();
+
+    #[cfg(feature="cache")]
+    let wait_for_guilds = move || -> ::Result<()> {
+        let unavailable_guilds = CACHE.read().unwrap().unavailable_guilds.len();
+
+        while unavailable_guilds != 0 && (now!() - last_guild_create_time < 2000) {
+            thread::sleep(time::Duration::from_millis(500));
+        }
+
+        Ok(())
+    };
+
     match event {
         Event::ChannelCreate(event) => {
             update!(update_with_channel_create, event);
@@ -180,6 +278,25 @@ fn handle_event<H: EventHandler + Send + Sync + 'static>(event: Event,
         },
         Event::GuildCreate(event) => {
             update!(update_with_guild_create, event);
+
+            #[cfg(feature="cache")]
+            {
+                last_guild_create_time = now!();
+
+                let cache = CACHE.read().unwrap();
+
+                if cache.unavailable_guilds.len() == 0 {
+                    let h = event_handler.clone();
+
+                    let context = context(conn, data);
+
+                    let guild_amount = cache.guilds.iter()
+                            .map(|(&id, _)| id)
+                            .collect::<Vec<GuildId>>();
+                    
+                    thread::spawn(move || h.on_cached(context, guild_amount));
+                }
+            }
 
             let context = context(conn, data);
 
@@ -274,7 +391,7 @@ fn handle_event<H: EventHandler + Send + Sync + 'static>(event: Event,
             feature_cache! {{
                 thread::spawn(move || h.on_guild_role_delete(context, event.guild_id, event.role_id, _role));
             } else {
-                thread::spawn(move || (handler)(context, event.guild_id, event.role_id));
+                thread::spawn(move || h.on_guild_role_delete(context, event.guild_id, event.role_id));
             }}
         },
         Event::GuildRoleUpdate(event) => {
@@ -350,18 +467,10 @@ fn handle_event<H: EventHandler + Send + Sync + 'static>(event: Event,
             let h = event_handler.clone();
             thread::spawn(move || h.on_presence_update(context, event));
         },
-        Event::ReactionAdd(event) => {
-            let context = context(conn, data);
 
-            let h = event_handler.clone();
-            thread::spawn(move || h.on_reaction_add(context, event.reaction));
-        },
-        Event::ReactionRemove(event) => {
-            let context = context(conn, data);
-
-            let h = event_handler.clone();
-            thread::spawn(move || h.on_reaction_remove(context, event.reaction));
-        },
+        // Already handled by the framework check macro
+        Event::ReactionAdd(_) => {},
+        Event::ReactionRemove(_) => {},
         Event::ReactionRemoveAll(event) => {
             let context = context(conn, data);
 
@@ -371,10 +480,22 @@ fn handle_event<H: EventHandler + Send + Sync + 'static>(event: Event,
         Event::Ready(event) => {
             update!(update_with_ready, event);
 
-            let context = context(conn, data);
+            feature_cache!{{
+                last_guild_create_time = now!();
 
-            let h = event_handler.clone();
-            thread::spawn(move || h.on_ready(context, event.ready));
+                let _ = wait_for_guilds()
+                .map(|_| {
+                    let context = context(conn, data);
+
+                    let h = event_handler.clone();
+                    thread::spawn(move || h.on_ready(context, event.ready));
+                });
+            } else {
+               let context = context(conn, data);
+
+                let h = event_handler.clone();
+                thread::spawn(move || h.on_ready(context, event.ready)); 
+            }}
         },
         Event::Resumed(event) => {
             let context = context(conn, data);
