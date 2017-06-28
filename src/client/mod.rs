@@ -26,6 +26,7 @@ mod event_handler;
 
 pub use self::context::Context;
 pub use self::error::Error as ClientError;
+pub use self::event_handler::EventHandler;
 
 // Note: the following re-exports are here for backwards compatibility
 pub use ::gateway;
@@ -35,7 +36,6 @@ pub use ::http as rest;
 pub use ::CACHE;
 
 use self::dispatch::dispatch;
-use self::event_handler::EventHandler;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use std::{mem, thread};
